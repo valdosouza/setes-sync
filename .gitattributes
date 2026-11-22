@@ -1,0 +1,2 @@
+# Núcleo fiscal pelo pacote versionado (D-F221): o .tgz é binário — nunca converter fim de linha
+vendor/*.tgz binary

@@ -4,7 +4,7 @@ import pool from '@shared/db/connection'
 import { PoolConnection } from 'mysql2/promise'
 import { syncSuccess, syncError } from '../sync.response'
 import { orderStatusField } from '../sync.order-status'
-import { findEntityIdByDocument, getInstitutionDocument, resolveSelfSalesman } from '../sync.entity'
+import { findEntityIdByDocument, getInstitutionDocument, resolveSelfSalesman, sameDocument } from '../sync.entity'
 import { userRefBody, resolveUserId, resolveFallbackUserId } from '../sync.user'
 import { ensureCatalogItem, upsertCatalogLink } from '../sync.catalog'
 import { invoiceProcessBlock, resolveInvoiceRefs, upsertInvoice, InvoiceRefs } from './invoice'
@@ -268,7 +268,7 @@ router.post('/order-service/sincronize', async (req: Request, res: Response) => 
       // grava o EMP_CODIGO da loja como vendedor em venda de balcão sem
       // representante; a institution vira seu próprio fallback.
       const institutionDoc = await getInstitutionDocument(conn, institutionId)
-      if (institutionDoc && institutionDoc === sale.salesmanDocument.replace(/\D/g, '')) {
+      if (sameDocument(institutionDoc, sale.salesmanDocument)) {
         await resolveSelfSalesman(conn, institutionId, schemaName)
         salesmanId = institutionId
         isSelfSalesman = true
@@ -281,7 +281,7 @@ router.post('/order-service/sincronize', async (req: Request, res: Response) => 
         }
         salesmanId = found
       }
-      if (sale.customerDocument && sale.customerDocument !== service.customerDocument) {
+      if (sale.customerDocument && !sameDocument(sale.customerDocument, service.customerDocument)) {
         const saleCust = await findEntityIdByDocument(conn, sale.customerDocument)
         if (saleCust === null) {
           throw new HttpError(409, `Cliente ${sale.customerDocument} ainda não sincronizado`,

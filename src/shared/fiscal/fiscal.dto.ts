@@ -1,11 +1,19 @@
 import { z } from 'zod'
-import { isValidCpf, isValidCnpj } from '../validation'
+import { isValidCpf, isValidCnpj, normalizeCpf, normalizeCnpj } from '../validation'
 
 /**
  * Schemas Zod FISCAIS (PF/PJ) — peça independente (SRP/ISP).
- * CPF/CNPJ chegam SEM máscara (decisão 19) e com dígito verificador
- * validado (decisão do Valdo, Rodada 3 — Fase 2 campos configuráveis).
+ * CPF/CNPJ com dígito verificador validado (decisão do Valdo, Rodada 3 — Fase 2
+ * campos configuráveis) pela peça do núcleo `FederalId` (frente do CNPJ
+ * alfanumérico, D-CJ2; setes-sync:CNPJ.E1.P2). SETES-SYNC#6 (Valdo, 2026-11-22):
+ * máscara e minúscula vindas do Delphi são CORRIGIDAS pela peça (tira só `.` `/`
+ * `-` e espaço, passa a maiúscula) e a forma canônica é a gravada; o que a peça
+ * não consegue canonicalizar segue CRU e é recusado — nunca se apaga letra.
  */
+
+/** Canonicaliza pela peça; sem forma canônica, devolve o valor cru para o refine recusar. */
+const canonicalOr = (normalize: (raw: unknown) => string | null) =>
+  (v: unknown) => (typeof v === 'string' ? normalize(v) ?? v : v)
 
 const dateRe = /^\d{4}-\d{2}-\d{2}$/
 
@@ -17,15 +25,15 @@ const optionalDate = z.preprocess(
 )
 
 export const personBody = z.object({
-  cpf:      z.string().regex(/^\d{11}$/, 'CPF deve ter 11 dígitos numéricos, sem máscara')
-             .refine(isValidCpf, 'CPF inválido (dígito verificador não confere)'),
+  cpf:      z.preprocess(canonicalOr(normalizeCpf),
+              z.string().refine(isValidCpf, 'CPF inválido: 11 dígitos com dígito verificador')),
   rg:       z.string().max(20).nullable().optional(),
   birthday: optionalDate,
 })
 
 export const companyBody = z.object({
-  cnpj:         z.string().regex(/^\d{14}$/, 'CNPJ deve ter 14 dígitos numéricos, sem máscara')
-                 .refine(isValidCnpj, 'CNPJ inválido (dígito verificador não confere)'),
+  cnpj:         z.preprocess(canonicalOr(normalizeCnpj),
+                  z.string().refine(isValidCnpj, 'CNPJ inválido: 12 letras ou números e 2 dígitos verificadores')),
   ie:           z.string().max(45).nullable().optional(),
   im:           z.string().max(45).nullable().optional(),
   dtFoundation: optionalDate,

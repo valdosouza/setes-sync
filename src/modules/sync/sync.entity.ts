@@ -4,6 +4,9 @@ import pool from '@shared/db/connection'
 import { HttpError } from '@shared/errors/http-error'
 import logger from '@shared/logger/logger'
 import {
+  isValidCpf, isValidCnpj, normalizeCpf, normalizeCnpj,
+} from '@shared/validation'
+import {
   EntityFiscalInput,
   entityFiscalBody,
   withFiscalRefinements,
@@ -106,19 +109,24 @@ export interface SyncContext {
 }
 
 // ---------------------------------------------------------------------
-// Normalização defensiva (dados gravados SEM máscara — padrão da casa)
+// Normalização defensiva (dados gravados na forma CANÔNICA — padrão da casa)
 // ---------------------------------------------------------------------
 
-const digitsOnly = (v: string) => v.replace(/\D/g, '')
-
-/** Remove máscara de CPF/CNPJ antes da validação Zod (defensivo — o
- *  contrato D22 pede sem máscara, mas o legado pode escorregar).
+/** Prepara o bloco de entidade antes da validação Zod (defensivo — o
+ *  contrato D22 pede limpo, mas o legado pode escorregar).
+ *  CPF/CNPJ (setes-sync:CNPJ.E1.P2): só viram TEXTO aqui; a canonicalização
+ *  (máscara/minúscula — SETES-SYNC#6) é da peça `FederalId`, no próprio DTO
+ *  (`fiscal.dto.ts`). O antigo "tira o que não é dígito" morreu: num CNPJ
+ *  alfanumérico ele dava OUTRO número (cerca D-CJ12).
  *  2026-08-03: também normaliza nome×fantasia — legado com um dos dois em
  *  branco (ex.: TB_USUARIO sem apelido) herda o outro em vez de 400. */
 export function stripDocumentMasks<T extends Record<string, any>>(body: T): T {
   const out: any = { ...body }
-  if (out.person?.cpf)    out.person  = { ...out.person,  cpf:  digitsOnly(String(out.person.cpf)) }
-  if (out.company?.cnpj)  out.company = { ...out.company, cnpj: digitsOnly(String(out.company.cnpj)) }
+  // Só número vira texto (Firebird/JSON podem mandar numérico); array/objeto seguem crus para o DTO recusar — `String(['…'])` dava
+  // um documento válido (confusão de tipo; gate adversarial do delta, 2026-11-22).
+  const asText = (v: unknown) => (typeof v === 'number' ? String(v) : v)
+  if (out.person?.cpf)    out.person  = { ...out.person,  cpf:  asText(out.person.cpf) }
+  if (out.company?.cnpj)  out.company = { ...out.company, cnpj: asText(out.company.cnpj) }
   if (out.entity) {
     const name = String(out.entity.nameCompany ?? '').trim()
     const nick = String(out.entity.nickTrade ?? '').trim()
@@ -133,23 +141,59 @@ export function stripDocumentMasks<T extends Record<string, any>>(body: T): T {
 // ---------------------------------------------------------------------
 
 /**
+ * Documento de REFERÊNCIA na forma canônica e VÁLIDO (DV conferido pela peça
+ * `FederalId`), ou undefined. CPF e CNPJ canônicos não se confundem (11
+ * dígitos × 12 letras/números + 2 dígitos, sem tirar nada). Usado pelos
+ * documentos tolerantes do legado (pedido de venda, nota — "documento
+ * inválido = sem documento", 2026-08-01/08-03; SETES-SYNC#9).
+ */
+function canonicalValidDocument(v: unknown): string | undefined {
+  const cpf = normalizeCpf(v)
+  if (cpf !== null && isValidCpf(cpf)) return cpf
+  const cnpj = normalizeCnpj(v)
+  return cnpj !== null && isValidCnpj(cnpj) ? cnpj : undefined
+}
+
+export function validDocumentOrUndefined(v: unknown): string | undefined {
+  const doc = canonicalValidDocument(v)
+  // O descarte deixa rastro (gate do delta, 2026-11-22): antes da peça, caractere fora da máscara era APAGADO e o documento casava;
+  // agora o valor vira "sem documento" (sentinela / entidade 0) — o log diz qual valor do legado caiu, como no email descartado.
+  if (doc === undefined && typeof v === 'string' && v.trim() !== '') {
+    logger.warn(`Documento de referência inválido do legado descartado: ${JSON.stringify(v)}`)
+  }
+  return doc
+}
+
+/** Os dois textos são a MESMA inscrição? Igualdade da forma canônica VÁLIDA (D-CJ3: a leitura canonicaliza) — nunca depois de
+ *  apagar caractere, e nunca casa sentinela/lixo (`'0'` × `'0..........'` casava; gate adversarial do delta, 2026-11-22). */
+export function sameDocument(a: string | null | undefined, b: string | null | undefined): boolean {
+  const ca = canonicalValidDocument(a)
+  return ca !== undefined && ca === canonicalValidDocument(b)
+}
+
+/**
  * Resolve REFERÊNCIA a outra entidade por documento (vendedor/transportador
- * do cliente etc.). CPF (11) ou CNPJ (14), sem máscara. null = não existe
- * na central (o endpoint decide: 409 de reenvio ou campo NULL).
+ * do cliente etc.). null = não existe na central (o endpoint decide: 409 de
+ * reenvio ou campo NULL). Leitura (D-CJ3): canonicaliza pela peça e escolhe a
+ * tabela pela FORMA canônica — CPF `[0-9]{11}` → tb_person, CNPJ
+ * `[0-9A-Z]{12}[0-9]{2}` → tb_company; fora das duas formas → null. Nunca o
+ * comprimento depois de tirar o que não é dígito: um CNPJ com 3 letras
+ * (12ABC345000188) virava 11 dígitos e era procurado como CPF.
  */
 export async function findEntityIdByDocument(
   conn: PoolConnection, document: string, lock = false
 ): Promise<number | null> {
-  const digits = document.replace(/\D/g, '')
   const forUpdate = lock ? ' FOR UPDATE' : ''
-  if (digits.length === 11) {
+  const cpf = normalizeCpf(document)
+  if (cpf !== null) {
     const [rows] = await conn.query<any[]>(
-      `SELECT id FROM setes_central.tb_person WHERE cpf = ? AND deleted = 'N' LIMIT 1${forUpdate}`, [digits])
+      `SELECT id FROM setes_central.tb_person WHERE cpf = ? AND deleted = 'N' LIMIT 1${forUpdate}`, [cpf])
     return rows.length ? Number(rows[0].id) : null
   }
-  if (digits.length === 14) {
+  const cnpj = normalizeCnpj(document)
+  if (cnpj !== null) {
     const [rows] = await conn.query<any[]>(
-      `SELECT id FROM setes_central.tb_company WHERE cnpj = ? AND deleted = 'N' LIMIT 1${forUpdate}`, [digits])
+      `SELECT id FROM setes_central.tb_company WHERE cnpj = ? AND deleted = 'N' LIMIT 1${forUpdate}`, [cnpj])
     return rows.length ? Number(rows[0].id) : null
   }
   return null

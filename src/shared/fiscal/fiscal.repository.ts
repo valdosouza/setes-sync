@@ -1,9 +1,31 @@
 import { randomUUID } from 'crypto'
 import { Pool, PoolConnection } from 'mysql2/promise'
 import pool from '@shared/db/connection'
+import { HttpError } from '@shared/errors/http-error'
 import { FiscalInput, PersonRow, CompanyRow, NoDocRow } from './fiscal.types'
 
 type Executor = Pool | PoolConnection
+
+/** Linha recusada por um CHECK: MariaDB `ER_CONSTRAINT_FAILED` (4025) · MySQL `ER_CHECK_CONSTRAINT_VIOLATED` (3819). */
+const CHECK_REFUSED_ERRNOS: ReadonlySet<number> = new Set([4025, 3819])
+/** Nome do CHECK de forma do CNPJ no central (D-CJ4 — setes-api:CNPJ.E4.P2); a tradução vale SÓ para ele. */
+export const CNPJ_FORM_CHECK = 'ck_company_cnpj_form'
+
+/**
+ * CHECK de forma do CNPJ no central (D-CJ4/D-CJ30 — `ck_company_cnpj_form`, criado pelo setes-api:CNPJ.E4.P2): a recusa do banco vira
+ * 422 `CNPJ_FORM` legível POR REGISTRO (o endpoint devolve o envelope de erro e o Sincronizador grava em SRC_LOG e segue a fila —
+ * CONTRATOS_SYNC.md), nunca um 500 genérico sem o campo. Não é erro transitório: só cura com o cadastro corrigido na origem.
+ * Reconhecida pelo número E pelo NOME do CHECK (gate do delta, 2026-11-22 — como o setes-api em `ibscbs-classification`): outro CHECK da
+ * tabela sobe como veio (diagnóstico falso de "CNPJ fora da forma" era pior que o 500).
+ */
+function cnpjFormRefused(err: unknown, cnpj: string): HttpError | null {
+  const e = err as { errno?: number; sqlMessage?: string; message?: string } | null
+  if (!e || !CHECK_REFUSED_ERRNOS.has(Number(e.errno))) return null
+  if (!String(e.sqlMessage ?? e.message ?? '').includes(CNPJ_FORM_CHECK)) return null
+  return new HttpError(422, `CNPJ fora da forma canônica recusado pelo banco central: ${cnpj}`,
+    [{ field: 'company.cnpj', message: 'CNPJ = 12 letras maiúsculas ou números + 2 dígitos verificadores, sem máscara' }],
+    'CNPJ_FORM')
+}
 
 /**
  * Persistência FISCAL (tb_person × tb_company × tb_no_doc, setes_central).
@@ -32,16 +54,20 @@ export async function upsertFiscal(
        input.person!.birthday ?? null, updatedBy]
     )
   } else if (input.personType === 'J') {
-    await conn.query(
-      `INSERT INTO setes_central.tb_company (id, cnpj, ie, im, dt_foundation, created_at, updated_at, updated_by)
-       VALUES (?, ?, ?, ?, ?, NOW(), NOW(), ?)
-       ON DUPLICATE KEY UPDATE
-         cnpj = VALUES(cnpj), ie = VALUES(ie), im = VALUES(im),
-         dt_foundation = VALUES(dt_foundation), deleted = 'N',
-         updated_at = NOW(), updated_by = VALUES(updated_by)`,
-      [entityId, input.company!.cnpj, input.company!.ie ?? null,
-       input.company!.im ?? null, input.company!.dtFoundation ?? null, updatedBy]
-    )
+    try {
+      await conn.query(
+        `INSERT INTO setes_central.tb_company (id, cnpj, ie, im, dt_foundation, created_at, updated_at, updated_by)
+         VALUES (?, ?, ?, ?, ?, NOW(), NOW(), ?)
+         ON DUPLICATE KEY UPDATE
+           cnpj = VALUES(cnpj), ie = VALUES(ie), im = VALUES(im),
+           dt_foundation = VALUES(dt_foundation), deleted = 'N',
+           updated_at = NOW(), updated_by = VALUES(updated_by)`,
+        [entityId, input.company!.cnpj, input.company!.ie ?? null,
+         input.company!.im ?? null, input.company!.dtFoundation ?? null, updatedBy]
+      )
+    } catch (err) {
+      throw cnpjFormRefused(err, input.company!.cnpj) ?? err
+    }
   } else {
     // 'N' — sem documento (decisão 5): external_id UUID v4 gerado aqui; se a
     // linha já existe (PK id), o ON DUPLICATE revive SEM trocar o external_id.

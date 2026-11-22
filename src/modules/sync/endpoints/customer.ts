@@ -4,7 +4,7 @@ import pool from '@shared/db/connection'
 import { syncSuccess, syncError } from '../sync.response'
 import {
   syncEntityBody, saveSyncEntity, stripDocumentMasks, findEntityIdByDocument,
-  getInstitutionDocument, resolveSelfSalesman,
+  getInstitutionDocument, resolveSelfSalesman, sameDocument,
 } from '../sync.entity'
 import { ensureCatalogItem, upsertCatalogLink } from '../sync.catalog'
 import { HttpError } from '@shared/errors/http-error'
@@ -132,7 +132,7 @@ router.post('/customer/sincronize', async (req: Request, res: Response) => {
       // grava o EMP_CODIGO da loja como vendedor de clientes sem
       // representante; a institution vira seu próprio fallback.
       const institutionDoc = await getInstitutionDocument(conn, institutionId)
-      if (institutionDoc && institutionDoc === cust.salesmanDocument.replace(/\D/g, '')) {
+      if (sameDocument(institutionDoc, cust.salesmanDocument)) {
         await resolveSelfSalesman(conn, institutionId, schemaName)
         salesmanId = institutionId
       } else {

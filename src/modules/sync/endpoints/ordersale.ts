@@ -4,8 +4,10 @@ import pool from '@shared/db/connection'
 import { PoolConnection } from 'mysql2/promise'
 import { syncSuccess, syncError } from '../sync.response'
 import { orderStatusField } from '../sync.order-status'
-import { findEntityIdByDocument, resolveSentinelRole, getInstitutionDocument, resolveSelfSalesman } from '../sync.entity'
-import { isValidCpf, isValidCnpj } from '@shared/validation'
+import {
+  findEntityIdByDocument, resolveSentinelRole, getInstitutionDocument, resolveSelfSalesman,
+  validDocumentOrUndefined, sameDocument,
+} from '../sync.entity'
 import { userRefBody, resolveUserId, resolveFallbackUserId } from '../sync.user'
 import { ensureCatalogItem, upsertCatalogLink } from '../sync.catalog'
 import { invoiceProcessBlock, resolveInvoiceRefs, upsertInvoice, InvoiceRefs } from './invoice'
@@ -41,15 +43,13 @@ const router = Router()
 /**
  * Documento de REFERÊNCIA tolerante (decisão Valdo — opção b, 2026-08-03):
  * ausente, zerado ou inválido (venda balcão do legado) vira undefined e o
- * processo resolve para o papel-SENTINELA (resolveSentinelRole). Válido é
- * normalizado sem máscara.
+ * processo resolve para o papel-SENTINELA (resolveSentinelRole). Válido vira
+ * a forma CANÔNICA pela peça `FederalId` — o CNPJ alfanumérico preserva as
+ * letras (setes-sync:CNPJ.E1.P2; antes elas eram apagadas e a venda caía no
+ * sentinela em silêncio).
  */
-const refDocument = z.preprocess(
-  v => {
-    if (typeof v !== 'string') return v
-    const digits = v.replace(/\D/g, '')
-    return isValidCpf(digits) || isValidCnpj(digits) ? digits : undefined
-  },
+export const refDocument = z.preprocess(
+  v => (typeof v === 'string' ? validDocumentOrUndefined(v) : v),
   z.string().min(11).max(18).optional()
 )
 
@@ -260,7 +260,7 @@ router.post('/order-sale/sincronize', async (req: Request, res: Response) => {
       // da loja como vendedor em venda de balcão sem representante — a
       // institution vira seu próprio fallback (papel real, não sentinela).
       const institutionDoc = await getInstitutionDocument(conn, institutionId)
-      if (institutionDoc && institutionDoc === sale.salesmanDocument.replace(/\D/g, '')) {
+      if (sameDocument(institutionDoc, sale.salesmanDocument)) {
         await resolveSelfSalesman(conn, institutionId, schemaName)
         salesmanId = institutionId
         isSelfSalesman = true

@@ -3,7 +3,7 @@ import { z } from 'zod'
 import { PoolConnection } from 'mysql2/promise'
 import pool from '@shared/db/connection'
 import { syncSuccess, syncError } from '../sync.response'
-import { findEntityIdByDocument } from '../sync.entity'
+import { findEntityIdByDocument, validDocumentOrUndefined } from '../sync.entity'
 import { HttpError } from '@shared/errors/http-error'
 import logger from '@shared/logger/logger'
 import { snFlag } from '@shared/validation'
@@ -37,13 +37,12 @@ export const invoiceBody = z.object({
   cfopId:         z.union([z.string().trim().min(1).max(10), z.number().int().positive()]).nullable().optional(),
   // Documento INVÁLIDO/curto do legado = SEM documento (2026-08-01, mesmo
   // precedente da decisão 2 de entidades): a nota espelha sem o vínculo de
-  // entidade (caso NFC-e consumidor) em vez de barrar em 400.
+  // entidade (caso NFC-e consumidor) em vez de barrar em 400. Desde a
+  // setes-sync:CNPJ.E1.P2: forma canônica + DV pela peça `FederalId` — o CNPJ
+  // alfanumérico preserva as letras e o DV errado também é "sem documento"
+  // (SETES-SYNC#9; antes ia à busca e dava 409 que nunca curava).
   entityDocument: z.preprocess(
-    v => {
-      if (typeof v !== 'string') return v
-      const digits = v.replace(/\D/g, '')
-      return digits.length === 11 || digits.length === 14 ? digits : undefined
-    },
+    v => (typeof v === 'string' ? validDocumentOrUndefined(v) : v),
     z.string().min(11).max(18).optional()
   ),
   dtEmission:     z.string().regex(/^\d{4}-\d{2}-\d{2}$/),
